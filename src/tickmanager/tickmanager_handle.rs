@@ -5,7 +5,8 @@ use crate::{HookID, MemberID, MemberState, TickStateReply};
 /// commands that can be sent to the TickManager
 pub enum TickCommand {
     // register a new member to the TickManager
-    Register(Sender<TickStateReply>),
+    // needs a speed factor
+    Register(Sender<TickStateReply>, usize),
     //remove a member from the TickManager
     Unregister(HookID),
 

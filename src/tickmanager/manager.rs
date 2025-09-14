@@ -1,7 +1,10 @@
 use core::fmt;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -17,13 +20,21 @@ pub enum Speed {
 }
 
 impl Speed {
+    /// whether we are allowed to start a new main frame
     pub fn new_frame(&self, last_frame: Instant) -> bool {
         match self {
             Speed::Fps(fps) => {
                 let duration = Duration::from_secs_f64(1.0 / *fps as f64);
-                last_frame + duration < Instant::now()
+                last_frame + duration <= Instant::now()
             }
-            Speed::Interval(dur) => last_frame + *dur < Instant::now(),
+            Speed::Interval(dur) => last_frame + *dur <= Instant::now(),
+        }
+    }
+
+    pub fn get_duration(&self) -> Duration {
+        match self {
+            Speed::Fps(fps) => Duration::from_secs_f64(1.0 / *fps as f64),
+            Speed::Interval(dur) => *dur,
         }
     }
 }
@@ -31,7 +42,6 @@ impl Speed {
 /// the state that will be sent to the Tick Hooks
 #[derive(Debug)]
 pub enum TickStateReply {
-    /// TickStateCommand to get the ID of the Tick Hook
     SelfID(HookID),
     MemberID(MemberID),
     Tick,
@@ -63,21 +73,28 @@ pub enum MemberState {
     Hidden,
 }
 
+pub type SpeedFactor = usize;
+
 #[derive(Clone, Debug)]
 pub struct MemberInfo {
     /// the sender to send TickStateReply to the Tick Hook
     pub sender: Sender<TickStateReply>,
     pub state: MemberState,
+
+    /// last time this member was ticked
+    pub last_tick: Instant,
 }
 
-/// struct that manages all Tick Hooks
+type InternalMap = HashMap<MemberID, (SpeedFactor, MemberInfo)>;
+
 pub struct TickManager {
     internal_receiver: Receiver<TickCommand>,
     /// map of all registered Tick members
-    member_map: Arc<Mutex<HashMap<usize, MemberInfo>>>,
+    member_map: Arc<Mutex<InternalMap>>,
     amount_of_members: Arc<AtomicUsize>,
-    /// time since last frame
+    /// time of last main tick
     instant: Arc<Mutex<Instant>>,
+    /// the speed of the global tick
     speed: Arc<Speed>,
 
     handle: Option<thread::JoinHandle<()>>,
@@ -87,9 +104,9 @@ pub struct TickManager {
 
 impl TickManager {
     pub fn new(speed: Speed) -> (Self, TickManagerHandle) {
-        let (global_sender, internal_receiver) = flume::bounded(1);
+        let (global_sender, internal_receiver) = flume::bounded(10);
 
-        let member_map = Arc::new(Mutex::new(HashMap::new()));
+        let member_map = Arc::new(Mutex::new(InternalMap::new()));
 
         let mut manager = TickManager {
             internal_receiver,
@@ -115,30 +132,35 @@ impl TickManager {
         let instant = self.instant.clone();
 
         self.handle = Some(thread::spawn(move || {
+            let mut main_tick_counter: usize = 0;
+
             loop {
                 while let Ok(command) = internal_receiver.try_recv() {
                     match command {
-                        // register a new Tick Hook
-                        TickCommand::Register(sender) => {
+                        TickCommand::Register(sender, speed_factor) => {
                             let mut map = member_map.lock().unwrap();
-                            let id = amount_of_members.load(std::sync::atomic::Ordering::SeqCst);
-                            amount_of_members.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let id = amount_of_members.fetch_add(1, Ordering::SeqCst);
                             let _ = sender.send(TickStateReply::SelfID(id));
-                            // assuming the member to be running when registering
                             map.insert(
                                 id,
-                                MemberInfo {
-                                    sender,
-                                    state: MemberState::Running,
-                                },
+                                (
+                                    if speed_factor == 0 { 1 } else { speed_factor },
+                                    MemberInfo {
+                                        sender,
+                                        state: MemberState::Running,
+                                        last_tick: Instant::now(),
+                                    },
+                                ),
                             );
                         }
+
                         TickCommand::ChangeMemberState(member_id, state) => {
                             let mut map = member_map.lock().unwrap();
-                            if let Some(member_info) = map.get_mut(&member_id) {
+                            if let Some((_sf, member_info)) = map.get_mut(&member_id) {
                                 member_info.state = state;
                             }
                         }
+
                         TickCommand::Unregister(id) => {
                             let mut map = member_map.lock().unwrap();
                             map.remove(&id);
@@ -150,37 +172,69 @@ impl TickManager {
                     }
                 }
 
-                let mut map = member_map.lock().unwrap();
-
-                let mut ready_members = 0;
-                let mut finished_members = 0;
-                for member_info in map.values_mut() {
-                    match member_info.state {
-                        MemberState::Running => {}
-                        MemberState::Finished => {
-                            finished_members += 1;
-                            ready_members += 1;
-                        }
-                        MemberState::Hidden => {
-                            ready_members += 1;
-                        }
-                    }
-                }
-
+                // determine if a new main frame can be started
                 {
                     let mut instant_guard = instant.lock().unwrap();
-                    if ready_members == map.len() && speed.new_frame(*instant_guard) {
+                    if speed.new_frame(*instant_guard) {
+                        main_tick_counter = main_tick_counter.wrapping_add(1);
                         *instant_guard = Instant::now();
-                        for member in map.values_mut() {
-                            if let MemberState::Finished = member.state {
-                                member.state = MemberState::Running;
+                        let due_members: Vec<MemberID> = {
+                            let map = member_map.lock().unwrap();
+                            map.iter()
+                                .filter_map(|(&member_id, &(sf, _))| {
+                                    let sf_nonzero = if sf == 0 { 1 } else { sf };
+                                    if main_tick_counter % sf_nonzero == 0 {
+                                        Some(member_id)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        };
+
+                        if !due_members.is_empty() {
+                            let all_ready = {
+                                let map = member_map.lock().unwrap();
+                                due_members.iter().all(|&id| {
+                                    if let Some((_sf, member_info)) = map.get(&id) {
+                                        matches!(
+                                            member_info.state,
+                                            MemberState::Finished | MemberState::Hidden
+                                        )
+                                    } else {
+                                        true
+                                    }
+                                })
+                            };
+
+                            if all_ready {
+                                let mut senders: Vec<Sender<TickStateReply>> = Vec::new();
+                                {
+                                    let mut map = member_map.lock().unwrap();
+                                    for id in due_members {
+                                        if let Some((_sf, member_info)) = map.get_mut(&id) {
+                                            match member_info.state {
+                                                MemberState::Finished | MemberState::Hidden => {
+                                                    member_info.state = MemberState::Running;
+                                                    member_info.last_tick = Instant::now();
+                                                    senders.push(member_info.sender.clone());
+                                                }
+                                                MemberState::Running => {
+                                                    // shouldn't happen
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                for s in senders {
+                                    let _ = s.send(TickStateReply::Tick);
+                                }
                             }
-                        }
-                        for member in map.values_mut() {
-                            let _ = member.sender.send(TickStateReply::Tick);
                         }
                     }
                 }
+
                 thread::yield_now();
             }
         }));
@@ -190,8 +244,8 @@ impl TickManager {
 impl Drop for TickManager {
     fn drop(&mut self) {
         if let Some(handler) = self.handle.take() {
-            self.global_sender.send(TickCommand::Shutdown).unwrap();
-            handler.join().unwrap();
+            let _ = self.global_sender.send(TickCommand::Shutdown);
+            let _ = handler.join();
         }
     }
 }

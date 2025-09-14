@@ -1,7 +1,7 @@
 use flume::Receiver;
 use std::time::Duration;
 
-use crate::{HookID, MemberID, MemberState, TickCommand, TickManagerHandle, TickStateReply};
+use crate::{HookID, MemberState, TickCommand, TickManagerHandle, TickStateReply};
 
 #[derive(Debug, Clone)]
 pub struct TickMember {
@@ -12,10 +12,12 @@ pub struct TickMember {
 
 impl TickMember {
     /// adds a new tick member to the Tick Manager
-    pub fn new(manager_handle: TickManagerHandle) -> Self {
-        let (sender, receiver) = flume::bounded(1);
+    pub fn new(manager_handle: TickManagerHandle, speed_factor: usize) -> Self {
+        let (sender, receiver) = flume::bounded(10);
         // register self and get id
-        manager_handle.send(TickCommand::Register(sender)).unwrap();
+        manager_handle
+            .send(TickCommand::Register(sender, speed_factor))
+            .unwrap();
         let id = expect_id(&receiver);
         Self {
             id,
@@ -68,19 +70,5 @@ fn expect_id(receiver: &Receiver<TickStateReply>) -> HookID {
     match reply {
         TickStateReply::SelfID(id) => id,
         unexpected => panic!("Expected SelfID, got {:?}", unexpected),
-    }
-}
-
-fn expect_member_id(receiver: &Receiver<TickStateReply>) -> MemberID {
-    let reply = match expect_reply(receiver) {
-        Ok(reply) => reply,
-        Err(e) => panic!(
-            "Did not receive TickStateReply in time while waiting for MemberID: {}",
-            e
-        ),
-    };
-    match reply {
-        TickStateReply::MemberID(id) => id,
-        unexpected => panic!("Expected MemberID, got {:?}", unexpected),
     }
 }
