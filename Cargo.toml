@@ -2,6 +2,9 @@
 name = "tick_manager_rs"
 version = "0.1.0"
 edition = "2024"
+description = "A tick manager for synchronizing ticks across multiple members with different tick rates."
+license = "MIT"
+repository = "https://github.com/simoncreates/tick_manager_rs"
 
 [dependencies]
 common-stdx = "0.1.6"
